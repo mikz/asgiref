@@ -1572,3 +1572,49 @@ def test_async_to_sync_with_stopped_main_loop():
         assert result["value"] == 42
     finally:
         loop.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_sync_to_async_does_not_restore_finished_executor(monkeypatch):
+    from asgiref.current_thread_executor import CurrentThreadExecutor
+
+    loop = asyncio.get_running_loop()
+    inner_finished = asyncio.Event()
+    release_thread = threading.Event()
+    original_run = CurrentThreadExecutor.run_until_future
+
+    def pause_before_context_restore(self, future):
+        original_run(self, future)
+        # The async child has finished, but AsyncToSync has not restored the
+        # synchronous caller's context yet. Hold this scheduling window open.
+        loop.call_soon_threadsafe(inner_finished.set)
+        assert release_thread.wait(5)
+
+    monkeypatch.setattr(
+        CurrentThreadExecutor, "run_until_future", pause_before_context_restore
+    )
+
+    async def inner():
+        return 1
+
+    def sync_caller():
+        return async_to_sync(inner)()
+
+    async def request():
+        try:
+            await sync_to_async(sync_caller)()
+        except asyncio.CancelledError:
+            release_thread.set()
+        # A cancelled request must still be able to perform synchronous cleanup.
+        return await sync_to_async(lambda: 42)()
+
+    async with ThreadSensitiveContext():
+        task = asyncio.create_task(request())
+        try:
+            await asyncio.wait_for(inner_finished.wait(), timeout=5)
+            task.cancel()
+            assert await asyncio.wait_for(task, timeout=5) == 42
+        finally:
+            release_thread.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
